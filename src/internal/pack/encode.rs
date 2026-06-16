@@ -1050,7 +1050,7 @@ mod tests {
     use crate::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
         internal::{
-            object::{blob::Blob, types::ObjectType},
+            object::{blob::Blob, tree::TreeItem, types::ObjectType},
             pack::{Pack, tests::init_logger, utils::read_offset_encoding},
         },
         time_it,
@@ -1081,6 +1081,114 @@ mod tests {
         tracing::debug!("start check format");
         p.decode(&mut reader, |_| {}, None::<fn(ObjectHash)>)
             .expect("pack file format error");
+    }
+
+    fn test_entry(obj_type: ObjectType, data: Vec<u8>) -> Entry {
+        Entry {
+            obj_type,
+            hash: ObjectHash::from_type_and_data(obj_type, &data),
+            data,
+            chain_len: 0,
+        }
+    }
+
+    fn meta_entry(entry: Entry, file_path: Option<&str>) -> MetaAttached<Entry, EntryMeta> {
+        MetaAttached {
+            inner: entry,
+            meta: EntryMeta {
+                file_path: file_path.map(str::to_owned),
+                ..EntryMeta::new()
+            },
+        }
+    }
+
+    fn tree_entry(tree: Tree) -> MetaAttached<Entry, EntryMeta> {
+        meta_entry(tree.into(), None)
+    }
+
+    fn commit_entry_for_tree(tree_id: ObjectHash) -> MetaAttached<Entry, EntryMeta> {
+        let data = format!("tree {tree_id}\n\nmessage\n").into_bytes();
+        meta_entry(test_entry(ObjectType::Commit, data), None)
+    }
+
+    #[test]
+    fn test_commit_root_tree_parses_first_line() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let tree_id = ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let commit = format!("tree {tree_id}\nparent deadbeef\n\nmessage\n");
+
+        assert_eq!(commit_root_tree(commit.as_bytes()), Some(tree_id));
+        assert_eq!(commit_root_tree(b"parent abc\n\nmessage\n"), None);
+    }
+
+    #[test]
+    fn test_infer_blob_paths_recovers_nested_tree_paths() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let blob = Blob::from_content("hello");
+        let nested_tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "file.rs".to_string(),
+        )])
+        .unwrap();
+        let root_tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::Tree,
+            nested_tree.id,
+            "src".to_string(),
+        )])
+        .unwrap();
+        let commit = commit_entry_for_tree(root_tree.id);
+        let trees = vec![tree_entry(root_tree), tree_entry(nested_tree)];
+
+        let paths = infer_blob_paths(&[commit], &trees);
+
+        assert_eq!(paths.get(&blob.id).map(String::as_str), Some("src/file.rs"));
+    }
+
+    #[test]
+    fn test_attach_inferred_blob_paths_preserves_existing_metadata() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let blob = Blob::from_content("hello");
+        let tree = Tree::from_tree_items(vec![TreeItem::new(
+            TreeItemMode::BlobExecutable,
+            blob.id,
+            "script.sh".to_string(),
+        )])
+        .unwrap();
+        let commit = commit_entry_for_tree(tree.id);
+        let trees = vec![tree_entry(tree)];
+        let mut inferred_blobs = vec![meta_entry(blob.clone().into(), None)];
+        let mut existing_blobs = vec![meta_entry(blob.into(), Some("keep/me"))];
+
+        attach_inferred_blob_paths(std::slice::from_ref(&commit), &trees, &mut inferred_blobs);
+        attach_inferred_blob_paths(&[commit], &trees, &mut existing_blobs);
+
+        assert_eq!(
+            inferred_blobs[0].meta.file_path.as_deref(),
+            Some("script.sh")
+        );
+        assert_eq!(existing_blobs[0].meta.file_path.as_deref(), Some("keep/me"));
+    }
+
+    #[test]
+    fn test_blob_delta_uses_same_path_zstdelta_when_smaller() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let base = Blob::from_content(&"abc123\n".repeat(512));
+        let changed = Blob::from_content(&format!("{}tail\n", "abc123\n".repeat(512)));
+        let blobs = vec![
+            meta_entry(base.into(), Some("src/lib.rs")),
+            meta_entry(changed.into(), Some("src/lib.rs")),
+        ];
+
+        let encoded = PackEncoder::try_blobs_as_offset_delta(blobs, 10, true).unwrap();
+
+        assert_eq!(encoded.len(), 2);
+        let encoded_delta = &encoded[1].0;
+        let pack_type = (encoded_delta[0] >> 4) & 0x07;
+        assert_eq!(
+            ObjectType::from_pack_type_u8(pack_type).unwrap(),
+            ObjectType::OffsetZstdelta
+        );
     }
 
     #[tokio::test]
