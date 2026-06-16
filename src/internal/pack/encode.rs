@@ -3,10 +3,11 @@
 
 use std::{
     cmp::Ordering,
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use ahash::AHasher;
@@ -26,7 +27,11 @@ use crate::{
     hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
-        object::types::ObjectType,
+        object::{
+            ObjectTrait,
+            tree::{Tree, TreeItemMode},
+            types::ObjectType,
+        },
         pack::{entry::Entry, index_entry::IndexEntry, pack_index::IdxBuilder},
     },
     time_it,
@@ -194,7 +199,7 @@ fn encode_one_object(entry: &Entry, offset: Option<usize>) -> Result<Vec<u8>, Gi
     }
 
     // **data** encoding, need zlib compress
-    let mut inflate = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut inflate = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
     inflate
         .write_all(obj_data)
         .expect("zlib compress should never failed");
@@ -318,6 +323,122 @@ fn score_delta_candidate(base: &Entry, entry: &Entry) -> Option<f64> {
     (rate > MIN_DELTA_RATE).then_some(rate)
 }
 
+fn same_blob_path(
+    base: &MetaAttached<Entry, EntryMeta>,
+    entry: &MetaAttached<Entry, EntryMeta>,
+) -> bool {
+    base.meta.file_path.is_some() && base.meta.file_path == entry.meta.file_path
+}
+
+fn infer_blob_paths(
+    commits: &[MetaAttached<Entry, EntryMeta>],
+    trees: &[MetaAttached<Entry, EntryMeta>],
+) -> HashMap<ObjectHash, String> {
+    let parsed_trees = trees
+        .iter()
+        .filter_map(|entry| {
+            Tree::from_bytes(&entry.inner.data, entry.inner.hash)
+                .ok()
+                .map(|tree| (entry.inner.hash, tree))
+        })
+        .collect::<HashMap<_, _>>();
+    if parsed_trees.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut blob_paths = HashMap::new();
+    let mut queue = commits
+        .iter()
+        .filter_map(|entry| commit_root_tree(&entry.inner.data))
+        .filter(|hash| parsed_trees.contains_key(hash))
+        .map(|hash| (hash, String::new()))
+        .collect::<VecDeque<_>>();
+
+    if queue.is_empty() {
+        queue.extend(
+            parsed_trees
+                .keys()
+                .copied()
+                .map(|hash| (hash, String::new())),
+        );
+    }
+
+    let mut visited = HashSet::new();
+    while let Some((tree_hash, prefix)) = queue.pop_front() {
+        if !visited.insert(tree_hash) {
+            continue;
+        }
+
+        let Some(tree) = parsed_trees.get(&tree_hash) else {
+            continue;
+        };
+
+        for item in &tree.tree_items {
+            let path = join_git_path(&prefix, &item.name);
+            match item.mode {
+                TreeItemMode::Tree => {
+                    if parsed_trees.contains_key(&item.id) {
+                        queue.push_back((item.id, path));
+                    }
+                }
+                TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link => {
+                    blob_paths.entry(item.id).or_insert(path);
+                }
+                TreeItemMode::Commit => {}
+            }
+        }
+    }
+
+    for tree in parsed_trees.values() {
+        for item in &tree.tree_items {
+            if matches!(
+                item.mode,
+                TreeItemMode::Blob | TreeItemMode::BlobExecutable | TreeItemMode::Link
+            ) {
+                blob_paths
+                    .entry(item.id)
+                    .or_insert_with(|| item.name.clone());
+            }
+        }
+    }
+
+    blob_paths
+}
+
+fn commit_root_tree(data: &[u8]) -> Option<ObjectHash> {
+    let line = data.split(|byte| *byte == b'\n').next()?;
+    let hex_hash = line.strip_prefix(b"tree ")?;
+    let hex_hash = std::str::from_utf8(hex_hash).ok()?;
+    ObjectHash::from_str(hex_hash).ok()
+}
+
+fn join_git_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn attach_inferred_blob_paths(
+    commits: &[MetaAttached<Entry, EntryMeta>],
+    trees: &[MetaAttached<Entry, EntryMeta>],
+    blobs: &mut [MetaAttached<Entry, EntryMeta>],
+) {
+    let blob_paths = infer_blob_paths(commits, trees);
+    if blob_paths.is_empty() {
+        return;
+    }
+
+    for blob in blobs {
+        if blob.meta.file_path.is_none()
+            && let Some(path) = blob_paths.get(&blob.inner.hash)
+        {
+            blob.meta.file_path = Some(path.clone());
+        }
+    }
+}
+
 fn candidate_is_better(rate: f64, base: &Entry, best_rate: f64, best_base: &Entry) -> bool {
     let tie_epsilon: f64 = 0.15;
     if rate > best_rate + tie_epsilon {
@@ -394,11 +515,10 @@ impl PackEncoder {
         &mut self,
         entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
     ) -> Result<(), GitError> {
-        //self.inner_encode(entry_rx, false).await
         if self.window_size == 0 {
             self.parallel_encode(entry_rx).await
         } else {
-            self.inner_encode(entry_rx, false).await
+            self.inner_encode(entry_rx, true).await
         }
     }
 
@@ -457,6 +577,7 @@ impl PackEncoder {
             self.process_index += 1;
         }
 
+        attach_inferred_blob_paths(&commits, &trees, &mut blobs);
         commits.sort_by(magic_sort);
         trees.sort_by(magic_sort);
         blobs.sort_by(magic_sort);
@@ -493,14 +614,7 @@ impl PackEncoder {
                 )
             }),
             tokio::task::spawn_blocking(move || {
-                Self::try_as_offset_delta(
-                    blobs
-                        .into_iter()
-                        .map(|entry_with_meta| entry_with_meta.inner)
-                        .collect(),
-                    window_size,
-                    enable_zstdelta,
-                )
+                Self::try_blobs_as_offset_delta(blobs, window_size, enable_zstdelta)
             }),
             tokio::task::spawn_blocking(move || {
                 Self::try_as_offset_delta(
@@ -621,6 +735,144 @@ impl PackEncoder {
             });
 
             entry_for_window.chain_len = entry.chain_len;
+            let obj_data = encode_one_object(entry, offset)?;
+            window.push_back((entry_for_window, current_offset));
+            if window.len() > window_size {
+                window.pop_front();
+            }
+            let obj_len = obj_data.len();
+            res.push((obj_data, IndexEntry::new(entry, 0)));
+            current_offset += obj_len;
+        }
+        Ok(res)
+    }
+
+    fn try_blobs_as_offset_delta(
+        mut bucket: Vec<MetaAttached<Entry, EntryMeta>>,
+        window_size: usize,
+        enable_zstdelta: bool,
+    ) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
+        let mut current_offset = 0usize;
+        let mut window: VecDeque<(MetaAttached<Entry, EntryMeta>, usize)> =
+            VecDeque::with_capacity(window_size);
+        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::with_capacity(bucket.len());
+
+        for entry_with_meta in bucket.iter_mut() {
+            let mut forced_delta = None;
+            if enable_zstdelta {
+                for base in window.iter().rev().filter(|base| {
+                    same_blob_path(&base.0, entry_with_meta)
+                        && base.0.inner.chain_len < MAX_CHAIN_LEN
+                        && base.0.inner.hash != entry_with_meta.inner.hash
+                }) {
+                    let delta = zstdelta::diff(&base.0.inner.data, &entry_with_meta.inner.data)
+                        .map_err(|e| {
+                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                        })?;
+                    if delta.len() < entry_with_meta.inner.data.len()
+                        && forced_delta.as_ref().is_none_or(
+                            |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
+                                delta.len() < best_delta.len()
+                            },
+                        )
+                    {
+                        forced_delta =
+                            Some((base.0.inner.chain_len + 1, current_offset - base.1, delta));
+                    }
+                }
+            }
+
+            let mut best_base: Option<&(MetaAttached<Entry, EntryMeta>, usize)> = None;
+            let mut best_rate: f64 = 0.0;
+            let mut best_delta: Option<Vec<u8>> = None;
+            if forced_delta.is_none() {
+                let candidates: Vec<_> = if window.len() >= PARALLEL_DELTA_WINDOW_THRESHOLD {
+                    window
+                        .par_iter()
+                        .filter_map(|try_base| {
+                            score_delta_candidate(&try_base.0.inner, &entry_with_meta.inner)
+                                .map(|rate| (rate, try_base))
+                        })
+                        .collect()
+                } else {
+                    window
+                        .iter()
+                        .filter_map(|try_base| {
+                            score_delta_candidate(&try_base.0.inner, &entry_with_meta.inner)
+                                .map(|rate| (rate, try_base))
+                        })
+                        .collect()
+                };
+
+                if enable_zstdelta {
+                    for (_, try_base) in candidates {
+                        let delta =
+                            zstdelta::diff(&try_base.0.inner.data, &entry_with_meta.inner.data)
+                                .map_err(|e| {
+                                    GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                                })?;
+                        if delta.len() < entry_with_meta.inner.data.len()
+                            && best_delta
+                                .as_ref()
+                                .is_none_or(|best_delta| delta.len() < best_delta.len())
+                        {
+                            best_base = Some(try_base);
+                            best_delta = Some(delta);
+                        }
+                    }
+                } else {
+                    for (rate, try_base) in candidates {
+                        match best_base {
+                            None => {
+                                best_rate = rate;
+                                best_base = Some(try_base);
+                            }
+                            Some(best_base_ref) => {
+                                if candidate_is_better(
+                                    rate,
+                                    &try_base.0.inner,
+                                    best_rate,
+                                    &best_base_ref.0.inner,
+                                ) {
+                                    best_rate = rate;
+                                    best_base = Some(try_base);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut entry_for_window = entry_with_meta.clone();
+            let entry = &mut entry_with_meta.inner;
+
+            let offset = if let Some((chain_len, offset, delta)) = forced_delta {
+                entry.obj_type = ObjectType::OffsetZstdelta;
+                entry.data = delta;
+                entry.chain_len = chain_len;
+                Some(offset)
+            } else {
+                best_base.map(|best_base| {
+                    let delta = if enable_zstdelta {
+                        entry.obj_type = ObjectType::OffsetZstdelta;
+                        best_delta.take().unwrap_or_else(|| {
+                            zstdelta::diff(&best_base.0.inner.data, &entry.data)
+                                .map_err(|e| {
+                                    GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                                })
+                                .unwrap()
+                        })
+                    } else {
+                        entry.obj_type = ObjectType::OffsetDelta;
+                        delta::encode(&best_base.0.inner.data, &entry.data)
+                    };
+                    entry.data = delta;
+                    entry.chain_len = best_base.0.inner.chain_len + 1;
+                    current_offset - best_base.1
+                })
+            };
+
+            entry_for_window.inner.chain_len = entry.chain_len;
             let obj_data = encode_one_object(entry, offset)?;
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {

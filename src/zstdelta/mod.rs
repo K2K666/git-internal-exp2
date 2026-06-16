@@ -13,11 +13,11 @@ use std::{cmp, ffi::CStr, io};
 
 use libc::c_void;
 use zstd_sys::{
-    ZSTD_CHAINLOG_MIN, ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN,
-    ZSTD_DCtx_setMaxWindowSize, ZSTD_HASHLOG_MIN, ZSTD_SEARCHLOG_MIN, ZSTD_WINDOWLOG_MIN,
-    ZSTD_compress_advanced, ZSTD_compressBound, ZSTD_compressionParameters, ZSTD_createCCtx,
-    ZSTD_createDCtx, ZSTD_decompress_usingDict, ZSTD_findDecompressedSize, ZSTD_frameParameters,
-    ZSTD_freeCCtx, ZSTD_freeDCtx, ZSTD_getErrorName, ZSTD_isError, ZSTD_parameters, ZSTD_strategy,
+    ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_DCtx_setMaxWindowSize, ZSTD_HASHLOG_MIN,
+    ZSTD_SEARCHLOG_MIN, ZSTD_WINDOWLOG_MIN, ZSTD_compress_advanced, ZSTD_compressBound,
+    ZSTD_compressionParameters, ZSTD_createCCtx, ZSTD_createDCtx, ZSTD_decompress_usingDict,
+    ZSTD_findDecompressedSize, ZSTD_frameParameters, ZSTD_freeCCtx, ZSTD_freeDCtx,
+    ZSTD_getErrorName, ZSTD_isError, ZSTD_parameters, ZSTD_strategy,
 };
 
 // They are complex "#define"s that are not exposed by bindgen automatically
@@ -54,12 +54,12 @@ pub fn diff(base: &[u8], data: &[u8]) -> io::Result<Vec<u8>> {
     let hlog = clamp(log, ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
     let cparams = ZSTD_compressionParameters {
         windowLog: wlog,
-        chainLog: ZSTD_CHAINLOG_MIN, // useless using "fast" strategy
+        chainLog: hlog,
         hashLog: hlog,
-        searchLog: ZSTD_SEARCHLOG_MIN, // useless using "fast" strategy
-        minMatch: 7,                   // level 1 default (see ZSTD_defaultCParameters)
-        targetLength: 0, // enable huffman compression of literals (for "fast" strategy)
-        strategy: ZSTD_strategy::ZSTD_fast,
+        searchLog: clamp(log, ZSTD_SEARCHLOG_MIN, 5),
+        minMatch: 5,
+        targetLength: 2,
+        strategy: ZSTD_strategy::ZSTD_greedy,
     };
     let fparams = ZSTD_frameParameters {
         contentSizeFlag: 1, // needed by `apply`
