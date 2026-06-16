@@ -42,6 +42,10 @@ use crate::{
 const MAX_CHAIN_LEN: usize = 50;
 const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
 const PARALLEL_DELTA_WINDOW_THRESHOLD: usize = 32;
+const BASENAME_DELTA_MIN_COUNT: usize = 3;
+const BASENAME_DELTA_MIN_SIZE: usize = 256;
+const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.35;
+const BASENAME_DELTA_MAX_ANCHOR_SIZE: usize = 2 * 1024 * 1024;
 //const MAX_ZSTDELTA_CHAIN_LEN: usize = 50;
 
 /// A encoder for generating pack files with delta objects.
@@ -328,6 +332,33 @@ fn same_blob_path(
     entry: &MetaAttached<Entry, EntryMeta>,
 ) -> bool {
     base.meta.file_path.is_some() && base.meta.file_path == entry.meta.file_path
+}
+
+fn blob_basename(entry: &MetaAttached<Entry, EntryMeta>) -> Option<String> {
+    let path = entry.meta.file_path.as_ref()?;
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+fn can_try_basename_zstdelta(
+    base: &MetaAttached<Entry, EntryMeta>,
+    entry: &MetaAttached<Entry, EntryMeta>,
+) -> bool {
+    if same_blob_path(base, entry)
+        || base.inner.chain_len >= MAX_CHAIN_LEN
+        || base.inner.hash == entry.inner.hash
+    {
+        return false;
+    }
+
+    let min_len = base.inner.data.len().min(entry.inner.data.len());
+    if min_len < BASENAME_DELTA_MIN_SIZE {
+        return false;
+    }
+
+    let sym_ratio = min_len as f64 / base.inner.data.len().max(entry.inner.data.len()) as f64;
+    sym_ratio >= BASENAME_DELTA_MIN_SIZE_RATIO
 }
 
 fn infer_blob_paths(
@@ -756,9 +787,22 @@ impl PackEncoder {
         let mut window: VecDeque<(MetaAttached<Entry, EntryMeta>, usize)> =
             VecDeque::with_capacity(window_size);
         let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::with_capacity(bucket.len());
+        let mut basename_counts: HashMap<String, usize> = HashMap::new();
+        for entry in &bucket {
+            if let Some(name) = blob_basename(entry) {
+                *basename_counts.entry(name).or_default() += 1;
+            }
+        }
+        let mut basename_anchors: HashMap<String, (MetaAttached<Entry, EntryMeta>, usize)> =
+            HashMap::new();
 
         for entry_with_meta in bucket.iter_mut() {
             let mut forced_delta = None;
+            let basename = blob_basename(entry_with_meta).filter(|name| {
+                basename_counts
+                    .get(name)
+                    .is_some_and(|count| *count >= BASENAME_DELTA_MIN_COUNT)
+            });
             if enable_zstdelta {
                 for base in window.iter().rev().filter(|base| {
                     same_blob_path(&base.0, entry_with_meta)
@@ -778,6 +822,30 @@ impl PackEncoder {
                     {
                         forced_delta =
                             Some((base.0.inner.chain_len + 1, current_offset - base.1, delta));
+                    }
+                }
+
+                if let Some((base, base_offset)) = basename
+                    .as_ref()
+                    .and_then(|name| basename_anchors.get(name))
+                    .filter(|(base, _)| can_try_basename_zstdelta(base, entry_with_meta))
+                {
+                    let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
+                        .map_err(|e| {
+                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                        })?;
+                    if delta.len() < entry_with_meta.inner.data.len()
+                        && forced_delta.as_ref().is_none_or(
+                            |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
+                                delta.len() < best_delta.len()
+                            },
+                        )
+                    {
+                        forced_delta = Some((
+                            base.inner.chain_len + 1,
+                            current_offset - *base_offset,
+                            delta,
+                        ));
                     }
                 }
             }
@@ -874,6 +942,19 @@ impl PackEncoder {
 
             entry_for_window.inner.chain_len = entry.chain_len;
             let obj_data = encode_one_object(entry, offset)?;
+            if let Some(name) = basename
+                && entry_for_window.inner.data.len() <= BASENAME_DELTA_MAX_ANCHOR_SIZE
+            {
+                basename_anchors
+                    .entry(name)
+                    .and_modify(|(base, offset)| {
+                        if entry_for_window.inner.data.len() > base.inner.data.len() {
+                            *base = entry_for_window.clone();
+                            *offset = current_offset;
+                        }
+                    })
+                    .or_insert_with(|| (entry_for_window.clone(), current_offset));
+            }
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
                 window.pop_front();
@@ -1184,6 +1265,34 @@ mod tests {
 
         assert_eq!(encoded.len(), 2);
         let encoded_delta = &encoded[1].0;
+        let pack_type = (encoded_delta[0] >> 4) & 0x07;
+        assert_eq!(
+            ObjectType::from_pack_type_u8(pack_type).unwrap(),
+            ObjectType::OffsetZstdelta
+        );
+    }
+
+    #[test]
+    fn test_blob_delta_uses_basename_anchor_outside_window() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let base = Blob::from_content(&"shared-setting=true\n".repeat(512));
+        let filler = Blob::from_content(&"different filler\n".repeat(512));
+        let changed = Blob::from_content(&format!(
+            "{}changed-setting=false\n",
+            "shared-setting=true\n".repeat(512)
+        ));
+        let extra_same_name = Blob::from_content(&"third settings file\n".repeat(64));
+        let blobs = vec![
+            meta_entry(base.into(), Some("crate-a/settings.toml")),
+            meta_entry(filler.into(), Some("crate-a/filler.txt")),
+            meta_entry(changed.into(), Some("crate-b/settings.toml")),
+            meta_entry(extra_same_name.into(), Some("crate-c/settings.toml")),
+        ];
+
+        let encoded = PackEncoder::try_blobs_as_offset_delta(blobs, 1, true).unwrap();
+
+        assert_eq!(encoded.len(), 4);
+        let encoded_delta = &encoded[2].0;
         let pack_type = (encoded_delta[0] >> 4) & 0x07;
         assert_eq!(
             ObjectType::from_pack_type_u8(pack_type).unwrap(),
