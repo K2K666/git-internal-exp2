@@ -42,10 +42,11 @@ use crate::{
 const MAX_CHAIN_LEN: usize = 50;
 const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
 const PARALLEL_DELTA_WINDOW_THRESHOLD: usize = 32;
-const BASENAME_DELTA_MIN_COUNT: usize = 3;
+const BASENAME_DELTA_MIN_COUNT: usize = 2;
 const BASENAME_DELTA_MIN_SIZE: usize = 256;
 const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.35;
 const BASENAME_DELTA_MAX_ANCHOR_SIZE: usize = 2 * 1024 * 1024;
+const BASENAME_DELTA_MAX_ANCHORS: usize = 2;
 //const MAX_ZSTDELTA_CHAIN_LEN: usize = 50;
 
 /// A encoder for generating pack files with delta objects.
@@ -359,6 +360,39 @@ fn can_try_basename_zstdelta(
 
     let sym_ratio = min_len as f64 / base.inner.data.len().max(entry.inner.data.len()) as f64;
     sym_ratio >= BASENAME_DELTA_MIN_SIZE_RATIO
+}
+
+fn insert_basename_anchor(
+    anchors: &mut HashMap<String, Vec<(MetaAttached<Entry, EntryMeta>, usize)>>,
+    name: String,
+    entry: MetaAttached<Entry, EntryMeta>,
+    offset: usize,
+) {
+    if entry.inner.data.len() > BASENAME_DELTA_MAX_ANCHOR_SIZE {
+        return;
+    }
+
+    let anchors_for_name = anchors.entry(name).or_default();
+    if anchors_for_name
+        .iter()
+        .any(|(base, _)| base.inner.hash == entry.inner.hash)
+    {
+        return;
+    }
+
+    anchors_for_name.push((entry, offset));
+    anchors_for_name.sort_by_key(|(base, _)| std::cmp::Reverse(base.inner.data.len()));
+    anchors_for_name.truncate(BASENAME_DELTA_MAX_ANCHORS);
+}
+
+fn closest_basename_anchor<'a>(
+    anchors: &'a [(MetaAttached<Entry, EntryMeta>, usize)],
+    entry: &MetaAttached<Entry, EntryMeta>,
+) -> Option<&'a (MetaAttached<Entry, EntryMeta>, usize)> {
+    anchors
+        .iter()
+        .filter(|(base, _)| can_try_basename_zstdelta(base, entry))
+        .min_by_key(|(base, _)| base.inner.data.len().abs_diff(entry.inner.data.len()))
 }
 
 fn infer_blob_paths(
@@ -793,7 +827,7 @@ impl PackEncoder {
                 *basename_counts.entry(name).or_default() += 1;
             }
         }
-        let mut basename_anchors: HashMap<String, (MetaAttached<Entry, EntryMeta>, usize)> =
+        let mut basename_anchors: HashMap<String, Vec<(MetaAttached<Entry, EntryMeta>, usize)>> =
             HashMap::new();
 
         for entry_with_meta in bucket.iter_mut() {
@@ -828,7 +862,7 @@ impl PackEncoder {
                 if let Some((base, base_offset)) = basename
                     .as_ref()
                     .and_then(|name| basename_anchors.get(name))
-                    .filter(|(base, _)| can_try_basename_zstdelta(base, entry_with_meta))
+                    .and_then(|anchors| closest_basename_anchor(anchors, entry_with_meta))
                 {
                     let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
                         .map_err(|e| {
@@ -942,18 +976,13 @@ impl PackEncoder {
 
             entry_for_window.inner.chain_len = entry.chain_len;
             let obj_data = encode_one_object(entry, offset)?;
-            if let Some(name) = basename
-                && entry_for_window.inner.data.len() <= BASENAME_DELTA_MAX_ANCHOR_SIZE
-            {
-                basename_anchors
-                    .entry(name)
-                    .and_modify(|(base, offset)| {
-                        if entry_for_window.inner.data.len() > base.inner.data.len() {
-                            *base = entry_for_window.clone();
-                            *offset = current_offset;
-                        }
-                    })
-                    .or_insert_with(|| (entry_for_window.clone(), current_offset));
+            if let Some(name) = basename {
+                insert_basename_anchor(
+                    &mut basename_anchors,
+                    name,
+                    entry_for_window.clone(),
+                    current_offset,
+                );
             }
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
@@ -1298,6 +1327,29 @@ mod tests {
             ObjectType::from_pack_type_u8(pack_type).unwrap(),
             ObjectType::OffsetZstdelta
         );
+    }
+
+    #[test]
+    fn test_closest_basename_anchor_prefers_nearest_size() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let small = meta_entry(
+            test_entry(ObjectType::Blob, b"small\n".repeat(100)),
+            Some("a/config.toml"),
+        );
+        let close = meta_entry(
+            test_entry(ObjectType::Blob, b"close\n".repeat(500)),
+            Some("b/config.toml"),
+        );
+        let entry = meta_entry(
+            test_entry(ObjectType::Blob, b"entry\n".repeat(520)),
+            Some("c/config.toml"),
+        );
+        let anchors = vec![(small, 10), (close.clone(), 20)];
+
+        let selected = closest_basename_anchor(&anchors, &entry).unwrap();
+
+        assert_eq!(selected.0.inner.hash, close.inner.hash);
+        assert_eq!(selected.1, 20);
     }
 
     #[tokio::test]
