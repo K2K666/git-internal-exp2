@@ -48,9 +48,9 @@ const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.15;
 const BASENAME_DELTA_MAX_ANCHOR_SIZE: usize = 2 * 1024 * 1024;
 const BASENAME_DELTA_MAX_ANCHORS: usize = 6;
 const CONTENT_DELTA_MIN_SIZE: usize = 256;
-const CONTENT_DELTA_MIN_SIZE_RATIO: f64 = 0.05;
+const CONTENT_DELTA_MIN_SIZE_RATIO: f64 = 0.25;
 const CONTENT_DELTA_MAX_ANCHOR_SIZE: usize = 8 * 1024 * 1024;
-const CONTENT_DELTA_MAX_ANCHORS: usize = 12;
+const CONTENT_DELTA_MAX_ANCHORS: usize = 6;
 const CONTENT_DELTA_SAMPLE_LEN: usize = 32;
 //const MAX_ZSTDELTA_CHAIN_LEN: usize = 50;
 
@@ -320,9 +320,10 @@ fn cheap_similar(a: &[u8], b: &[u8]) -> bool {
     let max_start = min_len - sample_len;
     let starts = [
         0,
-        max_start / 4,
-        max_start / 2,
-        max_start.saturating_mul(3) / 4,
+        max_start / 5,
+        max_start.saturating_mul(2) / 5,
+        max_start.saturating_mul(3) / 5,
+        max_start.saturating_mul(4) / 5,
         max_start,
     ];
 
@@ -423,10 +424,9 @@ fn blob_content_fingerprints(entry: &MetaAttached<Entry, EntryMeta>) -> Vec<u64>
     let max_start = data.len() - sample_len;
     let starts = [
         0,
-        max_start / 5,
-        max_start.saturating_mul(2) / 5,
-        max_start.saturating_mul(3) / 5,
-        max_start.saturating_mul(4) / 5,
+        max_start / 4,
+        max_start / 2,
+        max_start.saturating_mul(3) / 4,
         max_start,
     ];
     let mut fingerprints = Vec::with_capacity(starts.len());
@@ -486,14 +486,15 @@ fn insert_basename_anchor(
 fn insert_content_anchors(
     anchors: &mut ContentAnchors,
     entry: MetaAttached<Entry, EntryMeta>,
+    fingerprints: &[u64],
     offset: usize,
 ) {
     if entry.inner.data.len() > CONTENT_DELTA_MAX_ANCHOR_SIZE {
         return;
     }
 
-    for fingerprint in blob_content_fingerprints(&entry) {
-        let anchors_for_fingerprint = anchors.entry(fingerprint).or_default();
+    for fingerprint in fingerprints {
+        let anchors_for_fingerprint = anchors.entry(*fingerprint).or_default();
         if anchors_for_fingerprint
             .iter()
             .any(|(base, _)| base.inner.hash == entry.inner.hash)
@@ -945,6 +946,7 @@ impl PackEncoder {
 
         for entry_with_meta in bucket.iter_mut() {
             let mut forced_delta = None;
+            let content_fingerprints = blob_content_fingerprints(entry_with_meta);
             let basename = blob_basename(entry_with_meta).filter(|name| {
                 basename_counts
                     .get(name)
@@ -1000,8 +1002,8 @@ impl PackEncoder {
                     }
                 }
 
-                for fingerprint in blob_content_fingerprints(entry_with_meta) {
-                    let Some(anchors) = content_anchors.get(&fingerprint) else {
+                for fingerprint in &content_fingerprints {
+                    let Some(anchors) = content_anchors.get(fingerprint) else {
                         continue;
                     };
                     for (base, base_offset) in anchors
@@ -1133,6 +1135,7 @@ impl PackEncoder {
             insert_content_anchors(
                 &mut content_anchors,
                 entry_for_window.clone(),
+                &content_fingerprints,
                 current_offset,
             );
             window.push_back((entry_for_window, current_offset));
