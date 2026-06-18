@@ -8,6 +8,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use ahash::AHasher;
@@ -42,7 +43,7 @@ use crate::{
 const MAX_CHAIN_LEN: usize = 50;
 const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
 const PARALLEL_DELTA_WINDOW_THRESHOLD: usize = 32;
-const PARALLEL_ZSTD_CANDIDATE_THRESHOLD: usize = 8;
+const PARALLEL_ZSTD_CANDIDATE_THRESHOLD: usize = 16;
 const BASENAME_DELTA_MIN_COUNT: usize = 2;
 const BASENAME_DELTA_MIN_SIZE: usize = 256;
 const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.15;
@@ -384,7 +385,108 @@ fn same_blob_path(
     base.meta.file_path.is_some() && base.meta.file_path == entry.meta.file_path
 }
 
-type BlobAnchor = (MetaAttached<Entry, EntryMeta>, usize);
+#[derive(Clone)]
+struct BlobAnchor {
+    data: Arc<[u8]>,
+    hash: ObjectHash,
+    chain_len: usize,
+    file_path: Option<String>,
+    offset: usize,
+}
+
+impl BlobAnchor {
+    fn from_entry(entry: &MetaAttached<Entry, EntryMeta>, offset: usize) -> Self {
+        Self {
+            data: Arc::from(entry.inner.data.clone()),
+            hash: entry.inner.hash,
+            chain_len: entry.inner.chain_len,
+            file_path: entry.meta.file_path.clone(),
+            offset,
+        }
+    }
+}
+
+struct ForcedCandidate<'a> {
+    data: &'a [u8],
+    chain_len: usize,
+    offset: usize,
+}
+
+type ForcedDelta = (usize, usize, Vec<u8>);
+
+fn keep_smaller_delta(best: &mut Option<ForcedDelta>, candidate: ForcedDelta) {
+    if best
+        .as_ref()
+        .is_none_or(|(_, _, best_delta)| candidate.2.len() < best_delta.len())
+    {
+        *best = Some(candidate);
+    }
+}
+
+fn best_forced_zstdelta(
+    candidates: &[ForcedCandidate<'_>],
+    entry_data: &[u8],
+    current_offset: usize,
+) -> Result<Option<ForcedDelta>, GitError> {
+    let mut best = None;
+    for candidate in candidates {
+        let delta = zstdelta::diff(candidate.data, entry_data)
+            .map_err(|e| GitError::DeltaObjectError(format!("zstdelta diff failed: {e}")))?;
+        if delta.len() < entry_data.len() {
+            keep_smaller_delta(
+                &mut best,
+                (
+                    candidate.chain_len + 1,
+                    current_offset - candidate.offset,
+                    delta,
+                ),
+            );
+        }
+    }
+    Ok(best)
+}
+
+fn best_forced_zstdelta_parallel(
+    candidates: &[ForcedCandidate<'_>],
+    entry_data: &[u8],
+    current_offset: usize,
+) -> Result<Option<ForcedDelta>, GitError> {
+    if candidates.len() < PARALLEL_ZSTD_CANDIDATE_THRESHOLD {
+        return best_forced_zstdelta(candidates, entry_data, current_offset);
+    }
+
+    candidates
+        .par_iter()
+        .try_fold(
+            || None,
+            |mut best, candidate| {
+                let delta = zstdelta::diff(candidate.data, entry_data).map_err(|e| {
+                    GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                })?;
+                if delta.len() < entry_data.len() {
+                    keep_smaller_delta(
+                        &mut best,
+                        (
+                            candidate.chain_len + 1,
+                            current_offset - candidate.offset,
+                            delta,
+                        ),
+                    );
+                }
+                Ok(best)
+            },
+        )
+        .try_reduce(
+            || None,
+            |mut best, candidate_delta| {
+                if let Some(candidate_delta) = candidate_delta {
+                    keep_smaller_delta(&mut best, candidate_delta);
+                }
+                Ok(best)
+            },
+        )
+}
+
 type BasenameAnchors = HashMap<String, Vec<BlobAnchor>>;
 type ContentAnchors = HashMap<u64, Vec<BlobAnchor>>;
 
@@ -395,23 +497,20 @@ fn blob_basename(entry: &MetaAttached<Entry, EntryMeta>) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
 }
 
-fn can_try_basename_zstdelta(
-    base: &MetaAttached<Entry, EntryMeta>,
-    entry: &MetaAttached<Entry, EntryMeta>,
-) -> bool {
-    if same_blob_path(base, entry)
-        || base.inner.chain_len >= MAX_CHAIN_LEN
-        || base.inner.hash == entry.inner.hash
+fn can_try_basename_zstdelta(base: &BlobAnchor, entry: &MetaAttached<Entry, EntryMeta>) -> bool {
+    if (base.file_path.is_some() && base.file_path.as_ref() == entry.meta.file_path.as_ref())
+        || base.chain_len >= MAX_CHAIN_LEN
+        || base.hash == entry.inner.hash
     {
         return false;
     }
 
-    let min_len = base.inner.data.len().min(entry.inner.data.len());
+    let min_len = base.data.len().min(entry.inner.data.len());
     if min_len < BASENAME_DELTA_MIN_SIZE {
         return false;
     }
 
-    let sym_ratio = min_len as f64 / base.inner.data.len().max(entry.inner.data.len()) as f64;
+    let sym_ratio = min_len as f64 / base.data.len().max(entry.inner.data.len()) as f64;
     sym_ratio >= BASENAME_DELTA_MIN_SIZE_RATIO
 }
 
@@ -444,66 +543,49 @@ fn blob_content_fingerprints(entry: &MetaAttached<Entry, EntryMeta>) -> Vec<u64>
     fingerprints
 }
 
-fn can_try_content_zstdelta(
-    base: &MetaAttached<Entry, EntryMeta>,
-    entry: &MetaAttached<Entry, EntryMeta>,
-) -> bool {
-    if base.inner.chain_len >= MAX_CHAIN_LEN || base.inner.hash == entry.inner.hash {
+fn can_try_content_zstdelta(base: &BlobAnchor, entry: &MetaAttached<Entry, EntryMeta>) -> bool {
+    if base.chain_len >= MAX_CHAIN_LEN || base.hash == entry.inner.hash {
         return false;
     }
 
-    let min_len = base.inner.data.len().min(entry.inner.data.len());
+    let min_len = base.data.len().min(entry.inner.data.len());
     if min_len < CONTENT_DELTA_MIN_SIZE {
         return false;
     }
 
-    let sym_ratio = min_len as f64 / base.inner.data.len().max(entry.inner.data.len()) as f64;
+    let sym_ratio = min_len as f64 / base.data.len().max(entry.inner.data.len()) as f64;
     sym_ratio >= CONTENT_DELTA_MIN_SIZE_RATIO
 }
 
-fn insert_basename_anchor(
-    anchors: &mut BasenameAnchors,
-    name: String,
-    entry: MetaAttached<Entry, EntryMeta>,
-    offset: usize,
-) {
-    if entry.inner.data.len() > BASENAME_DELTA_MAX_ANCHOR_SIZE {
+fn insert_basename_anchor(anchors: &mut BasenameAnchors, name: String, anchor: BlobAnchor) {
+    if anchor.data.len() > BASENAME_DELTA_MAX_ANCHOR_SIZE {
         return;
     }
 
     let anchors_for_name = anchors.entry(name).or_default();
-    if anchors_for_name
-        .iter()
-        .any(|(base, _)| base.inner.hash == entry.inner.hash)
-    {
+    if anchors_for_name.iter().any(|base| base.hash == anchor.hash) {
         return;
     }
 
-    anchors_for_name.push((entry, offset));
-    anchors_for_name.sort_by_key(|(base, _)| std::cmp::Reverse(base.inner.data.len()));
+    anchors_for_name.push(anchor);
+    anchors_for_name.sort_by_key(|base| std::cmp::Reverse(base.data.len()));
     anchors_for_name.truncate(BASENAME_DELTA_MAX_ANCHORS);
 }
 
-fn insert_content_anchors(
-    anchors: &mut ContentAnchors,
-    entry: MetaAttached<Entry, EntryMeta>,
-    fingerprints: &[u64],
-    offset: usize,
-) {
-    if entry.inner.data.len() > CONTENT_DELTA_MAX_ANCHOR_SIZE {
+fn insert_content_anchors(anchors: &mut ContentAnchors, anchor: BlobAnchor, fingerprints: &[u64]) {
+    if anchor.data.len() > CONTENT_DELTA_MAX_ANCHOR_SIZE {
         return;
     }
-
     for fingerprint in fingerprints {
         let anchors_for_fingerprint = anchors.entry(*fingerprint).or_default();
         if anchors_for_fingerprint
             .iter()
-            .any(|(base, _)| base.inner.hash == entry.inner.hash)
+            .any(|base| base.hash == anchor.hash)
         {
             continue;
         }
 
-        anchors_for_fingerprint.push((entry.clone(), offset));
+        anchors_for_fingerprint.push(anchor.clone());
         if anchors_for_fingerprint.len() > CONTENT_DELTA_MAX_ANCHORS {
             anchors_for_fingerprint.remove(0);
         }
@@ -954,29 +1036,36 @@ impl PackEncoder {
                     .is_some_and(|count| *count >= BASENAME_DELTA_MIN_COUNT)
             });
             if enable_zstdelta {
-                let mut forced_candidates: Vec<(&MetaAttached<Entry, EntryMeta>, usize)> =
-                    Vec::new();
+                let mut forced_candidates: Vec<ForcedCandidate<'_>> = Vec::new();
                 for base in window.iter().rev().filter(|base| {
                     same_blob_path(&base.0, entry_with_meta)
                         && base.0.inner.chain_len < MAX_CHAIN_LEN
                         && base.0.inner.hash != entry_with_meta.inner.hash
                 }) {
-                    forced_candidates.push((&base.0, base.1));
+                    forced_candidates.push(ForcedCandidate {
+                        data: &base.0.inner.data,
+                        chain_len: base.0.inner.chain_len,
+                        offset: base.1,
+                    });
                 }
 
                 if let Some(anchors) = basename
                     .as_ref()
                     .and_then(|name| basename_anchors.get(name))
                 {
-                    for (base, base_offset) in anchors
+                    for base in anchors
                         .iter()
-                        .filter(|(base, _)| can_try_basename_zstdelta(base, entry_with_meta))
+                        .filter(|base| can_try_basename_zstdelta(base, entry_with_meta))
                     {
                         if !forced_candidates
                             .iter()
-                            .any(|(_, offset)| *offset == *base_offset)
+                            .any(|candidate| candidate.offset == base.offset)
                         {
-                            forced_candidates.push((base, *base_offset));
+                            forced_candidates.push(ForcedCandidate {
+                                data: &base.data,
+                                chain_len: base.chain_len,
+                                offset: base.offset,
+                            });
                         }
                     }
                 }
@@ -985,54 +1074,28 @@ impl PackEncoder {
                     let Some(anchors) = content_anchors.get(fingerprint) else {
                         continue;
                     };
-                    for (base, base_offset) in anchors
+                    for base in anchors
                         .iter()
-                        .filter(|(base, _)| can_try_content_zstdelta(base, entry_with_meta))
+                        .filter(|base| can_try_content_zstdelta(base, entry_with_meta))
                     {
                         if !forced_candidates
                             .iter()
-                            .any(|(_, offset)| *offset == *base_offset)
+                            .any(|candidate| candidate.offset == base.offset)
                         {
-                            forced_candidates.push((base, *base_offset));
+                            forced_candidates.push(ForcedCandidate {
+                                data: &base.data,
+                                chain_len: base.chain_len,
+                                offset: base.offset,
+                            });
                         }
                     }
                 }
 
-                let evaluate_forced_candidate =
-                    |(base, base_offset): &(&MetaAttached<Entry, EntryMeta>, usize)| {
-                        let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
-                            .map_err(|e| {
-                                GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
-                            })?;
-                        Ok((delta.len() < entry_with_meta.inner.data.len()).then_some((
-                            base.inner.chain_len + 1,
-                            current_offset - *base_offset,
-                            delta,
-                        )))
-                    };
-
-                let evaluated: Result<Vec<Option<(usize, usize, Vec<u8>)>>, GitError> =
-                    if forced_candidates.len() >= PARALLEL_ZSTD_CANDIDATE_THRESHOLD {
-                        forced_candidates
-                            .par_iter()
-                            .map(evaluate_forced_candidate)
-                            .collect()
-                    } else {
-                        forced_candidates
-                            .iter()
-                            .map(evaluate_forced_candidate)
-                            .collect()
-                    };
-
-                for candidate_delta in evaluated?.into_iter().flatten() {
-                    if forced_delta.as_ref().is_none_or(
-                        |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
-                            candidate_delta.2.len() < best_delta.len()
-                        },
-                    ) {
-                        forced_delta = Some(candidate_delta);
-                    }
-                }
+                forced_delta = best_forced_zstdelta_parallel(
+                    &forced_candidates,
+                    &entry_with_meta.inner.data,
+                    current_offset,
+                )?;
             }
 
             let mut best_base: Option<&(MetaAttached<Entry, EntryMeta>, usize)> = None;
@@ -1128,20 +1191,11 @@ impl PackEncoder {
 
             entry_for_window.inner.chain_len = entry.chain_len;
             let obj_data = encode_one_object(entry, offset)?;
+            let anchor = BlobAnchor::from_entry(&entry_for_window, current_offset);
             if let Some(name) = basename {
-                insert_basename_anchor(
-                    &mut basename_anchors,
-                    name,
-                    entry_for_window.clone(),
-                    current_offset,
-                );
+                insert_basename_anchor(&mut basename_anchors, name, anchor.clone());
             }
-            insert_content_anchors(
-                &mut content_anchors,
-                entry_for_window.clone(),
-                &content_fingerprints,
-                current_offset,
-            );
+            insert_content_anchors(&mut content_anchors, anchor, &content_fingerprints);
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
                 window.pop_front();
@@ -1504,7 +1558,8 @@ mod tests {
         let mut anchors = BasenameAnchors::new();
 
         for (index, entry) in entries.iter().cloned().enumerate() {
-            insert_basename_anchor(&mut anchors, "config.toml".to_string(), entry, index);
+            let anchor = BlobAnchor::from_entry(&entry, index);
+            insert_basename_anchor(&mut anchors, "config.toml".to_string(), anchor);
         }
 
         let selected = anchors.get("config.toml").unwrap();
@@ -1512,13 +1567,64 @@ mod tests {
         assert!(
             selected
                 .windows(2)
-                .all(|items| { items[0].0.inner.data.len() >= items[1].0.inner.data.len() })
+                .all(|items| { items[0].data.len() >= items[1].data.len() })
         );
         assert!(
             !selected
                 .iter()
-                .any(|(entry, _)| entry.inner.hash == entries[0].inner.hash)
+                .any(|anchor| anchor.hash == entries[0].inner.hash)
         );
+    }
+
+    #[test]
+    fn test_content_anchor_reuses_data_across_fingerprints() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let entry = meta_entry(
+            test_entry(
+                ObjectType::Blob,
+                b"repeatable content for anchor".repeat(64),
+            ),
+            Some("a/data.txt"),
+        );
+        let anchor = BlobAnchor::from_entry(&entry, 42);
+        let fingerprints = [1, 2];
+        let mut anchors = ContentAnchors::new();
+
+        insert_content_anchors(&mut anchors, anchor, &fingerprints);
+
+        let first = &anchors.get(&1).unwrap()[0];
+        let second = &anchors.get(&2).unwrap()[0];
+        assert_eq!(first.offset, 42);
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+    }
+
+    #[test]
+    fn test_best_forced_zstdelta_picks_smaller_delta() {
+        let base = b"aaaaabbbbbcccccdddddeeeee".repeat(256);
+        let mut close = base.clone();
+        close[8] = b'z';
+        let far = b"zzzzzyyyyyxxxxxwwwwwvvvvv".repeat(256);
+        let entry = close;
+        let candidates = [
+            ForcedCandidate {
+                data: &far,
+                chain_len: 0,
+                offset: 10,
+            },
+            ForcedCandidate {
+                data: &base,
+                chain_len: 2,
+                offset: 20,
+            },
+        ];
+
+        let best = best_forced_zstdelta(&candidates, &entry, 100)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(best.0, 3);
+        assert_eq!(best.1, 80);
+        assert!(best.2.len() < entry.len());
     }
 
     #[tokio::test]
