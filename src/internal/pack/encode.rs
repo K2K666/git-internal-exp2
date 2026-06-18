@@ -44,9 +44,14 @@ const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
 const PARALLEL_DELTA_WINDOW_THRESHOLD: usize = 32;
 const BASENAME_DELTA_MIN_COUNT: usize = 2;
 const BASENAME_DELTA_MIN_SIZE: usize = 256;
-const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.35;
+const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.15;
 const BASENAME_DELTA_MAX_ANCHOR_SIZE: usize = 2 * 1024 * 1024;
-const BASENAME_DELTA_MAX_ANCHORS: usize = 2;
+const BASENAME_DELTA_MAX_ANCHORS: usize = 6;
+const CONTENT_DELTA_MIN_SIZE: usize = 256;
+const CONTENT_DELTA_MIN_SIZE_RATIO: f64 = 0.05;
+const CONTENT_DELTA_MAX_ANCHOR_SIZE: usize = 8 * 1024 * 1024;
+const CONTENT_DELTA_MAX_ANCHORS: usize = 12;
+const CONTENT_DELTA_SAMPLE_LEN: usize = 32;
 //const MAX_ZSTDELTA_CHAIN_LEN: usize = 50;
 
 /// A encoder for generating pack files with delta objects.
@@ -204,7 +209,12 @@ fn encode_one_object(entry: &Entry, offset: Option<usize>) -> Result<Vec<u8>, Gi
     }
 
     // **data** encoding, need zlib compress
-    let mut inflate = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    let compression = if entry.obj_type == ObjectType::OffsetZstdelta {
+        flate2::Compression::new(6)
+    } else {
+        flate2::Compression::best()
+    };
+    let mut inflate = ZlibEncoder::new(Vec::new(), compression);
     inflate
         .write_all(obj_data)
         .expect("zlib compress should never failed");
@@ -249,6 +259,43 @@ fn magic_sort(a: &MetaAttached<Entry, EntryMeta>, b: &MetaAttached<Entry, EntryM
     }
 
     // fallback pointer order (newest first)
+    (a as *const MetaAttached<Entry, EntryMeta>).cmp(&(b as *const MetaAttached<Entry, EntryMeta>))
+}
+
+fn blob_magic_sort(
+    a: &MetaAttached<Entry, EntryMeta>,
+    b: &MetaAttached<Entry, EntryMeta>,
+) -> Ordering {
+    let path_a = a.meta.file_path.as_ref();
+    let path_b = b.meta.file_path.as_ref();
+
+    match (path_a, path_b) {
+        (Some(pa), Some(pb)) => {
+            let pa = Path::new(pa);
+            let pb = Path::new(pb);
+
+            let name_a = pa.file_name().unwrap_or_default().to_string_lossy();
+            let name_b = pb.file_name().unwrap_or_default().to_string_lossy();
+            let name_ord = compare(&name_a, &name_b);
+            if name_ord != Ordering::Equal {
+                return name_ord;
+            }
+
+            let dir_ord = pa.parent().cmp(&pb.parent());
+            if dir_ord != Ordering::Equal {
+                return dir_ord;
+            }
+        }
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => {}
+    }
+
+    let ord = b.inner.data.len().cmp(&a.inner.data.len());
+    if ord != Ordering::Equal {
+        return ord;
+    }
+
     (a as *const MetaAttached<Entry, EntryMeta>).cmp(&(b as *const MetaAttached<Entry, EntryMeta>))
 }
 
@@ -335,6 +382,10 @@ fn same_blob_path(
     base.meta.file_path.is_some() && base.meta.file_path == entry.meta.file_path
 }
 
+type BlobAnchor = (MetaAttached<Entry, EntryMeta>, usize);
+type BasenameAnchors = HashMap<String, Vec<BlobAnchor>>;
+type ContentAnchors = HashMap<u64, Vec<BlobAnchor>>;
+
 fn blob_basename(entry: &MetaAttached<Entry, EntryMeta>) -> Option<String> {
     let path = entry.meta.file_path.as_ref()?;
     Path::new(path)
@@ -362,8 +413,55 @@ fn can_try_basename_zstdelta(
     sym_ratio >= BASENAME_DELTA_MIN_SIZE_RATIO
 }
 
+fn blob_content_fingerprints(entry: &MetaAttached<Entry, EntryMeta>) -> Vec<u64> {
+    let data = &entry.inner.data;
+    if data.len() < CONTENT_DELTA_MIN_SIZE {
+        return Vec::new();
+    }
+
+    let sample_len = CONTENT_DELTA_SAMPLE_LEN.min(data.len());
+    let max_start = data.len() - sample_len;
+    let starts = [
+        0,
+        max_start / 5,
+        max_start.saturating_mul(2) / 5,
+        max_start.saturating_mul(3) / 5,
+        max_start.saturating_mul(4) / 5,
+        max_start,
+    ];
+    let mut fingerprints = Vec::with_capacity(starts.len());
+    let mut last_start = None;
+    for start in starts {
+        if last_start == Some(start) {
+            continue;
+        }
+        last_start = Some(start);
+        fingerprints.push(calc_hash(&data[start..start + sample_len]));
+    }
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    fingerprints
+}
+
+fn can_try_content_zstdelta(
+    base: &MetaAttached<Entry, EntryMeta>,
+    entry: &MetaAttached<Entry, EntryMeta>,
+) -> bool {
+    if base.inner.chain_len >= MAX_CHAIN_LEN || base.inner.hash == entry.inner.hash {
+        return false;
+    }
+
+    let min_len = base.inner.data.len().min(entry.inner.data.len());
+    if min_len < CONTENT_DELTA_MIN_SIZE {
+        return false;
+    }
+
+    let sym_ratio = min_len as f64 / base.inner.data.len().max(entry.inner.data.len()) as f64;
+    sym_ratio >= CONTENT_DELTA_MIN_SIZE_RATIO
+}
+
 fn insert_basename_anchor(
-    anchors: &mut HashMap<String, Vec<(MetaAttached<Entry, EntryMeta>, usize)>>,
+    anchors: &mut BasenameAnchors,
     name: String,
     entry: MetaAttached<Entry, EntryMeta>,
     offset: usize,
@@ -385,14 +483,29 @@ fn insert_basename_anchor(
     anchors_for_name.truncate(BASENAME_DELTA_MAX_ANCHORS);
 }
 
-fn closest_basename_anchor<'a>(
-    anchors: &'a [(MetaAttached<Entry, EntryMeta>, usize)],
-    entry: &MetaAttached<Entry, EntryMeta>,
-) -> Option<&'a (MetaAttached<Entry, EntryMeta>, usize)> {
-    anchors
-        .iter()
-        .filter(|(base, _)| can_try_basename_zstdelta(base, entry))
-        .min_by_key(|(base, _)| base.inner.data.len().abs_diff(entry.inner.data.len()))
+fn insert_content_anchors(
+    anchors: &mut ContentAnchors,
+    entry: MetaAttached<Entry, EntryMeta>,
+    offset: usize,
+) {
+    if entry.inner.data.len() > CONTENT_DELTA_MAX_ANCHOR_SIZE {
+        return;
+    }
+
+    for fingerprint in blob_content_fingerprints(&entry) {
+        let anchors_for_fingerprint = anchors.entry(fingerprint).or_default();
+        if anchors_for_fingerprint
+            .iter()
+            .any(|(base, _)| base.inner.hash == entry.inner.hash)
+        {
+            continue;
+        }
+
+        anchors_for_fingerprint.push((entry.clone(), offset));
+        if anchors_for_fingerprint.len() > CONTENT_DELTA_MAX_ANCHORS {
+            anchors_for_fingerprint.remove(0);
+        }
+    }
 }
 
 fn infer_blob_paths(
@@ -645,7 +758,7 @@ impl PackEncoder {
         attach_inferred_blob_paths(&commits, &trees, &mut blobs);
         commits.sort_by(magic_sort);
         trees.sort_by(magic_sort);
-        blobs.sort_by(magic_sort);
+        blobs.sort_by(blob_magic_sort);
         tags.sort_by(magic_sort);
         tracing::info!(
             "numbers :  commits: {:?} trees: {:?} blobs:{:?} tag :{:?}",
@@ -827,8 +940,8 @@ impl PackEncoder {
                 *basename_counts.entry(name).or_default() += 1;
             }
         }
-        let mut basename_anchors: HashMap<String, Vec<(MetaAttached<Entry, EntryMeta>, usize)>> =
-            HashMap::new();
+        let mut basename_anchors: BasenameAnchors = HashMap::new();
+        let mut content_anchors: ContentAnchors = HashMap::new();
 
         for entry_with_meta in bucket.iter_mut() {
             let mut forced_delta = None;
@@ -859,27 +972,59 @@ impl PackEncoder {
                     }
                 }
 
-                if let Some((base, base_offset)) = basename
+                if let Some(anchors) = basename
                     .as_ref()
                     .and_then(|name| basename_anchors.get(name))
-                    .and_then(|anchors| closest_basename_anchor(anchors, entry_with_meta))
                 {
-                    let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
-                        .map_err(|e| {
+                    for (base, base_offset) in anchors
+                        .iter()
+                        .filter(|(base, _)| can_try_basename_zstdelta(base, entry_with_meta))
+                    {
+                        let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
+                            .map_err(|e| {
                             GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
                         })?;
-                    if delta.len() < entry_with_meta.inner.data.len()
-                        && forced_delta.as_ref().is_none_or(
-                            |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
-                                delta.len() < best_delta.len()
-                            },
-                        )
+                        if delta.len() < entry_with_meta.inner.data.len()
+                            && forced_delta.as_ref().is_none_or(
+                                |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
+                                    delta.len() < best_delta.len()
+                                },
+                            )
+                        {
+                            forced_delta = Some((
+                                base.inner.chain_len + 1,
+                                current_offset - *base_offset,
+                                delta,
+                            ));
+                        }
+                    }
+                }
+
+                for fingerprint in blob_content_fingerprints(entry_with_meta) {
+                    let Some(anchors) = content_anchors.get(&fingerprint) else {
+                        continue;
+                    };
+                    for (base, base_offset) in anchors
+                        .iter()
+                        .filter(|(base, _)| can_try_content_zstdelta(base, entry_with_meta))
                     {
-                        forced_delta = Some((
-                            base.inner.chain_len + 1,
-                            current_offset - *base_offset,
-                            delta,
-                        ));
+                        let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
+                            .map_err(|e| {
+                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                        })?;
+                        if delta.len() < entry_with_meta.inner.data.len()
+                            && forced_delta.as_ref().is_none_or(
+                                |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
+                                    delta.len() < best_delta.len()
+                                },
+                            )
+                        {
+                            forced_delta = Some((
+                                base.inner.chain_len + 1,
+                                current_offset - *base_offset,
+                                delta,
+                            ));
+                        }
                     }
                 }
             }
@@ -956,14 +1101,15 @@ impl PackEncoder {
             } else {
                 best_base.map(|best_base| {
                     let delta = if enable_zstdelta {
-                        entry.obj_type = ObjectType::OffsetZstdelta;
-                        best_delta.take().unwrap_or_else(|| {
+                        let zstd_delta = best_delta.take().unwrap_or_else(|| {
                             zstdelta::diff(&best_base.0.inner.data, &entry.data)
                                 .map_err(|e| {
                                     GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
                                 })
                                 .unwrap()
-                        })
+                        });
+                        entry.obj_type = ObjectType::OffsetZstdelta;
+                        zstd_delta
                     } else {
                         entry.obj_type = ObjectType::OffsetDelta;
                         delta::encode(&best_base.0.inner.data, &entry.data)
@@ -984,6 +1130,11 @@ impl PackEncoder {
                     current_offset,
                 );
             }
+            insert_content_anchors(
+                &mut content_anchors,
+                entry_for_window.clone(),
+                current_offset,
+            );
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
                 window.pop_front();
@@ -1330,26 +1481,37 @@ mod tests {
     }
 
     #[test]
-    fn test_closest_basename_anchor_prefers_nearest_size() {
+    fn test_basename_anchor_keeps_largest_candidates() {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
-        let small = meta_entry(
-            test_entry(ObjectType::Blob, b"small\n".repeat(100)),
-            Some("a/config.toml"),
-        );
-        let close = meta_entry(
-            test_entry(ObjectType::Blob, b"close\n".repeat(500)),
-            Some("b/config.toml"),
-        );
-        let entry = meta_entry(
-            test_entry(ObjectType::Blob, b"entry\n".repeat(520)),
-            Some("c/config.toml"),
-        );
-        let anchors = vec![(small, 10), (close.clone(), 20)];
+        let entries = (1..=7)
+            .map(|size| {
+                meta_entry(
+                    test_entry(
+                        ObjectType::Blob,
+                        format!("blob-{size}\n").repeat(size * 100).into_bytes(),
+                    ),
+                    Some("a/config.toml"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut anchors = BasenameAnchors::new();
 
-        let selected = closest_basename_anchor(&anchors, &entry).unwrap();
+        for (index, entry) in entries.iter().cloned().enumerate() {
+            insert_basename_anchor(&mut anchors, "config.toml".to_string(), entry, index);
+        }
 
-        assert_eq!(selected.0.inner.hash, close.inner.hash);
-        assert_eq!(selected.1, 20);
+        let selected = anchors.get("config.toml").unwrap();
+        assert_eq!(selected.len(), BASENAME_DELTA_MAX_ANCHORS);
+        assert!(
+            selected
+                .windows(2)
+                .all(|items| { items[0].0.inner.data.len() >= items[1].0.inner.data.len() })
+        );
+        assert!(
+            !selected
+                .iter()
+                .any(|(entry, _)| entry.inner.hash == entries[0].inner.hash)
+        );
     }
 
     #[tokio::test]

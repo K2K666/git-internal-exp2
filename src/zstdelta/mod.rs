@@ -9,20 +9,30 @@
 //! when git offset deltas alone are not enough. Provides tuned compression parameters plus the
 //! complementary `apply` routine with robust error reporting.
 
-use std::{cmp, ffi::CStr, io};
+use std::{
+    cell::{Cell, RefCell},
+    cmp,
+    ffi::CStr,
+    io, ptr,
+};
 
 use libc::c_void;
 use zstd_sys::{
     ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_DCtx_setMaxWindowSize, ZSTD_HASHLOG_MIN,
     ZSTD_SEARCHLOG_MIN, ZSTD_WINDOWLOG_MIN, ZSTD_compress_advanced, ZSTD_compressBound,
     ZSTD_compressionParameters, ZSTD_createCCtx, ZSTD_createDCtx, ZSTD_decompress_usingDict,
-    ZSTD_findDecompressedSize, ZSTD_frameParameters, ZSTD_freeCCtx, ZSTD_freeDCtx,
-    ZSTD_getErrorName, ZSTD_isError, ZSTD_parameters, ZSTD_strategy,
+    ZSTD_findDecompressedSize, ZSTD_frameParameters, ZSTD_freeDCtx, ZSTD_getErrorName,
+    ZSTD_isError, ZSTD_parameters, ZSTD_strategy,
 };
 
 // They are complex "#define"s that are not exposed by bindgen automatically
 const ZSTD_WINDOWLOG_MAX: u32 = 30;
 const ZSTD_HASHLOG_MAX: u32 = 30;
+
+thread_local! {
+    static CCTX: Cell<*mut zstd_sys::ZSTD_CCtx> = const { Cell::new(ptr::null_mut()) };
+    static OUT_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Return `y` so `1 << y` is greater than `x`.
 /// Note: `1 << y` might be greater than `u64::MAX`.
@@ -72,34 +82,45 @@ pub fn diff(base: &[u8], data: &[u8]) -> io::Result<Vec<u8>> {
     };
 
     unsafe {
-        let cctx = ZSTD_createCCtx();
+        let cctx = CCTX.with(|cell| {
+            let cctx = cell.get();
+            if cctx.is_null() {
+                let cctx = ZSTD_createCCtx();
+                cell.set(cctx);
+                cctx
+            } else {
+                cctx
+            }
+        });
         if cctx.is_null() {
             return Err(io::Error::other("cannot create CCtx"));
         }
 
-        let max_outsize = ZSTD_compressBound(data.len());
-        let mut buf: Vec<u8> = vec![0; max_outsize];
+        OUT_BUF.with(|scratch| {
+            let max_outsize = ZSTD_compressBound(data.len());
+            let mut buf = scratch.borrow_mut();
+            if buf.len() < max_outsize {
+                buf.resize(max_outsize, 0);
+            }
 
-        let outsize = ZSTD_compress_advanced(
-            cctx,
-            buf.as_mut_ptr() as *mut c_void,
-            buf.len(),
-            data.as_ptr() as *const c_void,
-            data.len(),
-            base.as_ptr() as *const c_void,
-            base.len(),
-            params,
-        );
+            let outsize = ZSTD_compress_advanced(
+                cctx,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len(),
+                data.as_ptr() as *const c_void,
+                data.len(),
+                base.as_ptr() as *const c_void,
+                base.len(),
+                params,
+            );
 
-        ZSTD_freeCCtx(cctx);
-
-        if ZSTD_isError(outsize) != 0 {
-            let msg = format!("cannot compress ({})", explain_error(outsize));
-            Err(io::Error::other(msg))
-        } else {
-            buf.set_len(outsize);
-            Ok(buf)
-        }
+            if ZSTD_isError(outsize) != 0 {
+                let msg = format!("cannot compress ({})", explain_error(outsize));
+                Err(io::Error::other(msg))
+            } else {
+                Ok(buf[..outsize].to_vec())
+            }
+        })
     }
 }
 
