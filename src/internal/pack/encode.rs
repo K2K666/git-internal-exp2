@@ -42,6 +42,7 @@ use crate::{
 const MAX_CHAIN_LEN: usize = 50;
 const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
 const PARALLEL_DELTA_WINDOW_THRESHOLD: usize = 32;
+const PARALLEL_ZSTD_CANDIDATE_THRESHOLD: usize = 8;
 const BASENAME_DELTA_MIN_COUNT: usize = 2;
 const BASENAME_DELTA_MIN_SIZE: usize = 256;
 const BASENAME_DELTA_MIN_SIZE_RATIO: f64 = 0.15;
@@ -953,25 +954,14 @@ impl PackEncoder {
                     .is_some_and(|count| *count >= BASENAME_DELTA_MIN_COUNT)
             });
             if enable_zstdelta {
+                let mut forced_candidates: Vec<(&MetaAttached<Entry, EntryMeta>, usize)> =
+                    Vec::new();
                 for base in window.iter().rev().filter(|base| {
                     same_blob_path(&base.0, entry_with_meta)
                         && base.0.inner.chain_len < MAX_CHAIN_LEN
                         && base.0.inner.hash != entry_with_meta.inner.hash
                 }) {
-                    let delta = zstdelta::diff(&base.0.inner.data, &entry_with_meta.inner.data)
-                        .map_err(|e| {
-                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
-                        })?;
-                    if delta.len() < entry_with_meta.inner.data.len()
-                        && forced_delta.as_ref().is_none_or(
-                            |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
-                                delta.len() < best_delta.len()
-                            },
-                        )
-                    {
-                        forced_delta =
-                            Some((base.0.inner.chain_len + 1, current_offset - base.1, delta));
-                    }
+                    forced_candidates.push((&base.0, base.1));
                 }
 
                 if let Some(anchors) = basename
@@ -982,22 +972,11 @@ impl PackEncoder {
                         .iter()
                         .filter(|(base, _)| can_try_basename_zstdelta(base, entry_with_meta))
                     {
-                        let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
-                            .map_err(|e| {
-                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
-                        })?;
-                        if delta.len() < entry_with_meta.inner.data.len()
-                            && forced_delta.as_ref().is_none_or(
-                                |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
-                                    delta.len() < best_delta.len()
-                                },
-                            )
+                        if !forced_candidates
+                            .iter()
+                            .any(|(_, offset)| *offset == *base_offset)
                         {
-                            forced_delta = Some((
-                                base.inner.chain_len + 1,
-                                current_offset - *base_offset,
-                                delta,
-                            ));
+                            forced_candidates.push((base, *base_offset));
                         }
                     }
                 }
@@ -1010,23 +989,48 @@ impl PackEncoder {
                         .iter()
                         .filter(|(base, _)| can_try_content_zstdelta(base, entry_with_meta))
                     {
+                        if !forced_candidates
+                            .iter()
+                            .any(|(_, offset)| *offset == *base_offset)
+                        {
+                            forced_candidates.push((base, *base_offset));
+                        }
+                    }
+                }
+
+                let evaluate_forced_candidate =
+                    |(base, base_offset): &(&MetaAttached<Entry, EntryMeta>, usize)| {
                         let delta = zstdelta::diff(&base.inner.data, &entry_with_meta.inner.data)
                             .map_err(|e| {
-                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
-                        })?;
-                        if delta.len() < entry_with_meta.inner.data.len()
-                            && forced_delta.as_ref().is_none_or(
-                                |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
-                                    delta.len() < best_delta.len()
-                                },
-                            )
-                        {
-                            forced_delta = Some((
-                                base.inner.chain_len + 1,
-                                current_offset - *base_offset,
-                                delta,
-                            ));
-                        }
+                                GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                            })?;
+                        Ok((delta.len() < entry_with_meta.inner.data.len()).then_some((
+                            base.inner.chain_len + 1,
+                            current_offset - *base_offset,
+                            delta,
+                        )))
+                    };
+
+                let evaluated: Result<Vec<Option<(usize, usize, Vec<u8>)>>, GitError> =
+                    if forced_candidates.len() >= PARALLEL_ZSTD_CANDIDATE_THRESHOLD {
+                        forced_candidates
+                            .par_iter()
+                            .map(evaluate_forced_candidate)
+                            .collect()
+                    } else {
+                        forced_candidates
+                            .iter()
+                            .map(evaluate_forced_candidate)
+                            .collect()
+                    };
+
+                for candidate_delta in evaluated?.into_iter().flatten() {
+                    if forced_delta.as_ref().is_none_or(
+                        |(_, _, best_delta): &(usize, usize, Vec<u8>)| {
+                            candidate_delta.2.len() < best_delta.len()
+                        },
+                    ) {
+                        forced_delta = Some(candidate_delta);
                     }
                 }
             }
